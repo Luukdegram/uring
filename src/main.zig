@@ -33,7 +33,7 @@ const Ring = struct {
         /// Erased pointer to a context type
         context: ?*c_void,
         /// The callback to call upon completion
-        callback: fn (completion: *Completion) void,
+        callback: fn (completion: *Completion, result: anyerror!i32) void,
 
         fn from_addr(ptr: u64) *Completion {
             return @intToPtr(*Completion, ptr);
@@ -65,6 +65,11 @@ const Ring = struct {
             buffer: []u8,
             flags: u32,
         },
+        send: struct {
+            socket: i32,
+            buffer: []const u8,
+            flags: u32,
+        },
     };
 
     /// Ensures we get a new queue submission,
@@ -89,11 +94,10 @@ const Ring = struct {
         while (true) {
             const found = try self.io.copy_cqes(&queue, 0);
             if (found == 0) {
-                break; // no completions
+                return; // no completions
             }
             // For each completed entry, add them to our linked-list
             for (queue[0..found]) |cqe| {
-                std.debug.print("CQE: {}\n", .{cqe});
                 const completed = Completion.from_addr(cqe.user_data);
                 completed.result = cqe.res;
 
@@ -109,7 +113,7 @@ const Ring = struct {
         }
     }
 
-    fn prep(self: *Ring, completion: *Completion) !void {
+    fn submit(self: *Ring, completion: *Completion) !void {
         const sqe = try self.get_sqe();
         switch (completion.op) {
             .accept => |*op| linux.io_uring_prep_accept(
@@ -120,6 +124,12 @@ const Ring = struct {
                 op.flags,
             ),
             .recv => |op| linux.io_uring_prep_recv(
+                sqe,
+                op.socket,
+                op.buffer,
+                op.flags,
+            ),
+            .send => |op| linux.io_uring_prep_send(
                 sqe,
                 op.socket,
                 op.buffer,
@@ -140,18 +150,42 @@ const Ring = struct {
     fn complete(self: *Ring, completion: *Ring.Completion) !void {
         switch (completion.op) {
             .accept => {
-                switch (err(completion.result)) {
-                    .SUCCESS => {},
-                    .INTR => {
-                        try self.prep(completion);
+                const result = switch (err(completion.result)) {
+                    .SUCCESS => completion.result,
+                    .INTR, .AGAIN => {
+                        try self.submit(completion);
                         return;
                     },
                     else => |err_no| return os.unexpectedErrno(err_no),
-                }
-                std.debug.print("Completion: {}\n", .{completion});
-                completion.callback(completion);
+                };
+                completion.callback(completion, result);
             },
-            else => @panic("TODO Complete for other operations"),
+            .recv => {
+                const result = switch (err(completion.result)) {
+                    .SUCCESS => completion.result,
+                    .INTR => {
+                        try self.submit(completion);
+                        return;
+                    },
+                    .CONNRESET => error.PeerResetConnection,
+                    else => |err_no| return os.unexpectedErrno(err_no),
+                };
+                completion.callback(completion, result);
+            },
+            .send => {
+                const result = switch (err(completion.result)) {
+                    .SUCCESS => completion.result,
+                    .INTR => {
+                        try self.submit(completion);
+                        return;
+                    },
+                    .CONNRESET => error.PeerResetConnection,
+                    .PIPE => error.BrokenPipe,
+                    else => |err_no| return os.unexpectedErrno(err_no),
+                };
+                completion.callback(completion, result);
+            },
+            // else => @panic("TODO Complete for other operations"),
         }
     }
 
@@ -207,7 +241,8 @@ const Server = struct {
     /// Appends a new submission to accept a new client connection
     fn accept(self: *Server) !void {
         const accept_callback = struct {
-            fn callback(completion: *Ring.Completion) void {
+            fn callback(completion: *Ring.Completion, result: anyerror!i32) void {
+                _ = result catch {};
                 const server = completion.get_context(*Server);
                 defer server.accept() catch |err| {
                     log.err("Unexpected error: {s}, shutting down", .{@errorName(err)});
@@ -215,7 +250,9 @@ const Server = struct {
                 };
                 const socket = completion.result;
                 const index = server.free_client_slots.pop();
-                server.clients[index] = Client.run(index, socket, &server.ring) catch |err| {
+                const client = &server.clients[index];
+                client.* = undefined;
+                Client.run(client, index, socket, &server.ring) catch |err| {
                     log.warn("Failed to initialize client: {s}", .{@errorName(err)});
                     os.close(socket);
                     server.free_client_slots.appendAssumeCapacity(index);
@@ -236,17 +273,18 @@ const Server = struct {
                 },
             },
         };
-        try self.ring.prep(&self.completion);
+        try self.ring.submit(&self.completion);
     }
 
     /// Creates a new socket for the server to listen on, binds it to the given
     /// `address` and finally starts listening to new connections.
     pub fn listen(self: *Server, address: std.net.Address) !void {
         self.socket = try os.socket(
-            address.any.family,
-            os.SOCK.STREAM | os.SOCK.CLOEXEC,
-            0,
+            os.AF.INET,
+            os.SOCK.STREAM | os.SOCK.NONBLOCK | os.SOCK.CLOEXEC,
+            os.IPPROTO.TCP,
         );
+        errdefer os.close(self.socket);
 
         try os.setsockopt(
             self.socket,
@@ -256,13 +294,15 @@ const Server = struct {
         );
         const socklen = address.getOsSockLen();
         try os.bind(self.socket, &address.any, socklen);
-        try os.listen(self.socket, 10);
+        try os.listen(self.socket, 128);
     }
 
     /// Starts accepting new connections and initializes
     /// new clients for those, to read requests and send responses.
     pub fn run(self: *Server) !void {
         try self.free_client_slots.ensureTotalCapacity(self.gpa, 128);
+        defer self.free_client_slots.deinit(self.gpa);
+
         self.setup_free_slots();
         try self.accept();
         while (true) {
@@ -281,45 +321,95 @@ const Client = struct {
     /// Pointer to the io-uring object, allowing us to queue
     /// submissions to perform syscalls such as reads and writes.
     ring: *Ring,
-    /// The state the client. This determines whether the completion
-    /// is a read action, or a write action.
-    state: enum { read, write },
-    /// Completion event that will be submitted to the queue
-    completion: Ring.Completion,
+    reader: Reader,
+    writer: Writer,
 
-    pub fn run(index: u7, socket: i32, ring: *Ring) !Client {
-        var client: Client = .{
-            .index = index,
-            .socket = socket,
-            .ring = ring,
-            .state = .read,
+    pub fn run(self: *Client, index: u7, socket: i32, ring: *Ring) !void {
+        // var self: Client = undefined;
+
+        try std.os.setsockopt(socket, 6, os.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
+
+        self.index = index;
+        self.socket = socket;
+        self.ring = ring;
+
+        try self.reader.init();
+        try self.writer.init();
+
+        // return self;
+    }
+};
+
+const Reader = struct {
+    completion: Ring.Completion,
+    buffer: [4096]u8,
+
+    pub fn init(self: *Reader) !void {
+        self.* = .{
             .completion = undefined,
+            .buffer = undefined,
         };
 
-        try client.recv();
-        return client;
+        try self.recv();
     }
 
-    fn recv(self: *Client) !void {
-        var buf: [4096]u8 = undefined;
-        const recv_callback = struct {
-            fn callback(completion: *Ring.Completion) void {
-                const len = @intCast(usize, completion.result);
-                const content = completion.op.recv.buffer[0..len];
-                std.debug.print("Content: ----\n{s}", .{content});
-            }
-        }.callback;
-
-        self.state = .read;
+    fn recv(self: *Reader) !void {
+        const client = @fieldParentPtr(Client, "reader", self);
         self.completion = .{
             .context = self,
             .callback = recv_callback,
             .op = .{ .recv = .{
-                .buffer = &buf,
-                .socket = self.socket,
+                .buffer = &self.buffer,
+                .socket = client.socket,
                 .flags = os.linux.SOCK.CLOEXEC | os.linux.SOCK.NONBLOCK,
             } },
         };
-        try self.ring.prep(&self.completion);
+        try client.ring.submit(&self.completion);
+    }
+
+    fn recv_callback(completion: *Ring.Completion, result: anyerror!i32) void {
+        const self = completion.get_context(*Reader);
+        if ((result catch 0) != 0)
+            self.recv() catch {};
     }
 };
+
+const Writer = struct {
+    completion: Ring.Completion,
+
+    fn init(self: *Writer) !void {
+        self.* = .{ .completion = undefined };
+        try self.send();
+    }
+
+    fn send(self: *Writer) !void {
+        const client = @fieldParentPtr(Client, "writer", self);
+        self.completion = .{
+            .context = self,
+            .callback = send_callback,
+            .op = .{
+                .send = .{
+                    .buffer = HTTP_RESPONSE,
+                    .socket = client.socket,
+                    .flags = os.linux.SOCK.CLOEXEC | os.linux.SOCK.NONBLOCK,
+                },
+            },
+        };
+        try client.ring.submit(&self.completion);
+    }
+
+    fn send_callback(completion: *Ring.Completion, result: anyerror!i32) void {
+        const self = completion.get_context(*Writer);
+        _ = result catch return;
+        self.send() catch {};
+    }
+};
+
+const HTTP_RESPONSE =
+    "HTTP/1.1 200 Ok\r\n" ++
+    "Content-Length: 10\r\n" ++
+    "Content-Type: text/plain; charset=utf8\r\n" ++
+    "Date: Thu, 19 Nov 2021 15:26:34 GMT\r\n" ++
+    "Server: uring-example\r\n" ++
+    "\r\n" ++
+    "HelloWorld";
