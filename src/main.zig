@@ -135,7 +135,6 @@ const Ring = struct {
                 op.buffer,
                 op.flags,
             ),
-            // else => @panic("TODO prep for other operations"),
         }
         sqe.user_data = completion.as_addr();
     }
@@ -185,7 +184,6 @@ const Ring = struct {
                 };
                 completion.callback(completion, result);
             },
-            // else => @panic("TODO Complete for other operations"),
         }
     }
 
@@ -250,9 +248,7 @@ const Server = struct {
                 };
                 const socket = completion.result;
                 const index = server.free_client_slots.pop();
-                const client = &server.clients[index];
-                client.* = undefined;
-                Client.run(client, index, socket, &server.ring) catch |err| {
+                Client.run(&server.clients[index], index, socket, &server.ring) catch |err| {
                     log.warn("Failed to initialize client: {s}", .{@errorName(err)});
                     os.close(socket);
                     server.free_client_slots.appendAssumeCapacity(index);
@@ -325,8 +321,6 @@ const Client = struct {
     writer: Writer,
 
     pub fn run(self: *Client, index: u7, socket: i32, ring: *Ring) !void {
-        // var self: Client = undefined;
-
         try std.os.setsockopt(socket, 6, os.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
 
         self.index = index;
@@ -335,8 +329,6 @@ const Client = struct {
 
         try self.reader.init();
         try self.writer.init();
-
-        // return self;
     }
 };
 
@@ -407,9 +399,9 @@ const Writer = struct {
 
 const HTTP_RESPONSE =
     "HTTP/1.1 200 Ok\r\n" ++
-    "Content-Length: 10\r\n" ++
+    "Content-Length: 11\r\n" ++
     "Content-Type: text/plain; charset=utf8\r\n" ++
     "Date: Thu, 19 Nov 2021 15:26:34 GMT\r\n" ++
     "Server: uring-example\r\n" ++
     "\r\n" ++
-    "HelloWorld";
+    "Hello World";
