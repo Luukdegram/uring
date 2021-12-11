@@ -361,8 +361,10 @@ const Reader = struct {
 
     fn recv_callback(completion: *Ring.Completion, result: anyerror!i32) void {
         const self = completion.get_context(*Reader);
-        if ((result catch 0) != 0)
-            self.recv() catch {};
+        if ((result catch 0) != 0) {
+            const client = @fieldParentPtr(Client, "reader", self);
+            client.writer.send() catch {};
+        }
     }
 };
 
@@ -371,7 +373,6 @@ const Writer = struct {
 
     fn init(self: *Writer) !void {
         self.* = .{ .completion = undefined };
-        try self.send();
     }
 
     fn send(self: *Writer) !void {
@@ -393,7 +394,8 @@ const Writer = struct {
     fn send_callback(completion: *Ring.Completion, result: anyerror!i32) void {
         const self = completion.get_context(*Writer);
         _ = result catch return;
-        self.send() catch {};
+        const client = @fieldParentPtr(Client, "writer", self);
+        client.reader.recv() catch {};
     }
 };
 
