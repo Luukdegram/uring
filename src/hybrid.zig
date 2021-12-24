@@ -31,7 +31,7 @@ const Ring = struct {
         /// The operation that was/is queued
         op: Op,
         /// Erased pointer to a context type
-        context: ?*c_void,
+        context: ?*anyopaque,
         /// The callback to call upon completion
         callback: fn (completion: *Completion, result: anyerror!i32) void,
 
